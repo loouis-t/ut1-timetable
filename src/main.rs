@@ -105,43 +105,85 @@ async fn connect_to_planning(url: &str) -> Result<Vec<PlanningEvent>, String> {
         .map(|s| parse_int(s))
         .collect::<Vec<_>>();
 
-    let events = scrape_events(&tab, &planning_container).await
-        .expect("Failed to scrape events");
-
-    Ok(events)
-}
-
-async fn scrape_events(tab: &Arc<Tab>, planning_container: &Vec<i32>) -> Result<Vec<PlanningEvent>, String> {
-
+    // create a vec containing 5 tabs (parallelize scraping)
+    println!("Creating new tabs");
+    let mut handles = Vec::new();
     let mut week = chrono::Local::now().iso_week().week();
-    let mut events = Vec::new();
+    let mut tabs = Vec::new();
+    tabs.push(tab.clone());
+    for _i in 1..5 {
+        let new_tab = browser.new_tab()
+            .expect("Failed to create new tab");
+        tabs.push(new_tab);
+    }
 
-    for _i in 0..5 {
-        println!("Scraping week {}", week);
+    for tab in tabs {
+        let planning_container_clone = planning_container.clone();
+        let url_clone = url.to_string();
+        let handle = tokio::spawn(async move {
+            let real_week = chrono::Local::now().iso_week().week();
+            if (week - real_week) > 0 {
+                println!("New thread for week {} navigating to url", week);
+                tab.navigate_to(url_clone.as_str())
+                    .expect("Failed to navigate");
 
-        // put all elements in div.grilleData in a vector
-        let html_planning_events = tab.find_elements("div.grilleData > div")
-            .expect("Failed to find elements");
+                // wait for div.grilleData to load
+                tab.wait_for_element("div.grilleData")
+                    .expect("Failed to find element");
 
-        events.extend(parse_events(html_planning_events, &week).await
-            .expect("Failed to parse events"));
+                // click on next week tab
+                tab.find_element(format!("table#x-auto-{}", week - 1).as_str())
+                    .expect("Failed to find element")
+                    .click().unwrap();
 
-        tab.find_element(format!("table#x-auto-{}", week).as_str())
-            .expect("Failed to find element")
-            .click().unwrap();
+                // wait for div.grilleData to load
+                tab.wait_for_element("div.grilleData")
+                    .expect("Failed to find element");
+            }
 
-        // wait for div.grilleData to load (first had already loaded)
-        tab.wait_for_element("div.grilleData")
-            .expect("Failed to find element");
-
+            scrape_events(&tab, &planning_container_clone, &week).await
+        });
+        handles.push(handle);
         week += 1;
     }
 
-    // convert PlanningEventCollected to PlanningEvent
-    let events = convert_events(&events, &planning_container).await
-        .expect("Failed to convert events");
+    let mut all_events = Vec::new();
 
-    Ok(events)
+    for handle in handles {
+        let events = handle.await
+            .expect("Thread panicked")
+            .expect("Failed to scrape events");
+        all_events.extend(events);
+    }
+
+    /*let events = scrape_events(&tab, &planning_container).await
+        .expect("Failed to scrape events");*/
+
+    Ok(all_events)
+}
+
+async fn scrape_events(tab: &Arc<Tab>, planning_container: &Vec<i32>, week: &u32) -> Result<Vec<PlanningEvent>, String> {
+    let mut events = Vec::new();
+
+    println!("Scraping week {}", week);
+
+    // put all elements in div.grilleData in a vector
+    let formatted_events;
+    match tab.find_elements("div.grilleData > div") {
+        Ok(elements) => {
+            println!("Parsing events for week {}", week);
+            // add events of current week to PlanningEventCollected vec
+            events.extend(parse_events(elements, &week).await
+                .expect("Failed to parse events"));
+
+            // convert PlanningEventCollected to PlanningEvent
+            formatted_events = convert_events(&events, &planning_container).await
+                .expect("Failed to convert events");
+        }
+        Err(_) => formatted_events = Vec::new(),
+    };
+
+    Ok(formatted_events)
 }
 
 async fn parse_events(html_events: Vec<Element<'_>>, week: &u32) -> Result<Vec<PlanningEventCollected>, String> {
