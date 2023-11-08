@@ -15,3 +15,7 @@ Cargo.lock
 
 # environment variable file
 .env
+
+# Potentially generated files (dev)
+*.png
+*.ics
