@@ -1,10 +1,12 @@
-use headless_chrome::{Browser, Element, Tab};
+use headless_chrome::{Browser, Element, LaunchOptions, Tab};
 use std::{
     env::var,
     sync::Arc,
 };
+use anyhow::anyhow;
 use chrono::{Datelike, Duration, Utc, Weekday};
 use dotenv::dotenv;
+use headless_chrome::browser::default_executable;
 use ics::{Event, ICalendar, properties::{
     Summary,
     Location,
@@ -53,8 +55,17 @@ async fn main() {
         .expect("Failed to create ics file");
 }
 
-async fn connect_to_planning(url: &str) -> Result<Vec<PlanningEvent>, String> {
-    let browser = Browser::default()
+async fn connect_to_planning(url: &str) -> Result<Vec<PlanningEvent>, anyhow::Error> {
+    let mut chrome_args = Vec::new();
+    chrome_args.push(std::ffi::OsStr::new("--blink-settings=imagesEnabled=false"));
+
+    let launch_options = LaunchOptions::default_builder()
+        .path(Some(default_executable().map_err(|e| anyhow!(e))?))
+        .enable_gpu(true)
+        .args(chrome_args)
+        .build()?;
+
+    let browser = Browser::new(launch_options)
         .expect("Failed to launch browser");
 
     let tab = browser.new_tab()
@@ -111,7 +122,11 @@ async fn connect_to_planning(url: &str) -> Result<Vec<PlanningEvent>, String> {
     let mut week = chrono::Local::now().iso_week().week();
     let mut tabs = Vec::new();
     tabs.push(tab.clone());
-    for _i in 1..5 {
+    let nb_weeks_to_scrape = var("NB_WEEKS_TO_SCRAPE")
+        .expect("NB_WEEKS_TO_SCRAPE not set")
+        .parse::<i8>()
+        .unwrap();
+    for _i in 1..nb_weeks_to_scrape {
         let new_tab = browser.new_tab()
             .expect("Failed to create new tab");
         tabs.push(new_tab);
@@ -147,17 +162,15 @@ async fn connect_to_planning(url: &str) -> Result<Vec<PlanningEvent>, String> {
         week += 1;
     }
 
-    let mut all_events = Vec::new();
+    println!("Merging events from different threads");
 
+    let mut all_events = Vec::new();
     for handle in handles {
         let events = handle.await
             .expect("Thread panicked")
             .expect("Failed to scrape events");
         all_events.extend(events);
     }
-
-    /*let events = scrape_events(&tab, &planning_container).await
-        .expect("Failed to scrape events");*/
 
     Ok(all_events)
 }
@@ -258,6 +271,9 @@ async fn parse_events(html_events: Vec<Element<'_>>, week: &u32) -> Result<Vec<P
 }
 
 async fn convert_events(events: &Vec<PlanningEventCollected>, planning_container: &Vec<i32>) -> Result<Vec<PlanningEvent>, String> {
+
+    println!("Converting events from week {}", events[0].week);
+
     let mut converted_events = Vec::new();
 
     // store today 7 am in date format
@@ -301,6 +317,9 @@ async fn convert_events(events: &Vec<PlanningEventCollected>, planning_container
 }
 
 async fn create_ics(events: &Vec<PlanningEvent>) -> Result<&str, std::io::Error> {
+    println!("Creating ics file from merged events");
+
+    // create ics calendar
     let mut calendar = ICalendar::new("2.0", "https://www.github.com/loouis-t/ut1-timetable");
 
     // loop over events to create ics events
@@ -323,6 +342,9 @@ async fn create_ics(events: &Vec<PlanningEvent>) -> Result<&str, std::io::Error>
 
     // Save ics file in directory
     calendar.save_file("ut1.ics")?;
+
+    std::fs::copy("ut1.ics", "/Users/louistravaux/Documents/test/public/ut1.ics")
+        .expect("Failed to copy ics file to directory");
 
     Ok("ICS saved in directory")
 }
