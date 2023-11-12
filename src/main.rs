@@ -349,7 +349,7 @@ async fn create_ics(events: &Vec<PlanningEvent>) -> Result<&str, std::io::Error>
 
     if var("PROD") == Ok("true".to_string()) {
         // scp ics file to server
-        let mut child = std::process::Command::new("scp")
+        std::process::Command::new("scp")
             .arg("ut1.ics")
             .arg(format!(
                 "{}:{}",
