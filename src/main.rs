@@ -6,7 +6,19 @@ use std::{
 use anyhow::anyhow;
 use chrono::{Datelike, Duration, Utc, Weekday};
 use dotenv::dotenv;
-use headless_chrome::browser::default_executable;
+use headless_chrome::{
+    browser::{
+        default_executable,
+        transport::{
+            SessionId,
+            Transport,
+        },
+    },
+};
+use headless_chrome::browser::tab::{
+    RequestInterceptor,
+    RequestPausedDecision,
+};
 use ics::{Event, ICalendar, properties::{
     Summary,
     Location,
@@ -17,19 +29,10 @@ use ics::{Event, ICalendar, properties::{
 }};
 use rand::random;
 
-#[derive(Debug)]
-pub struct PlanningEventCollected {
-    pub x: i32,
-    pub y: i32,
-    pub width: i32,
-    pub height: i32,
-    pub cours: String,
-    pub salle: String,
-    pub prof: String,
-    pub groupe: Vec<String>,
-    pub notes: String,
-    pub week: u32,
-}
+
+use headless_chrome::protocol::cdp::{Fetch::events::RequestPausedEvent};
+use headless_chrome::protocol::cdp::Fetch::{FailRequest};
+use headless_chrome::protocol::cdp::Network::ErrorReason;
 
 #[derive(Debug, Clone)]
 pub struct PlanningEvent {
@@ -38,8 +41,31 @@ pub struct PlanningEvent {
     pub cours: String,
     pub prof: String,
     pub salle: String,
-    pub groupe: Vec<String>,
     pub notes: String,
+}
+
+struct MyRequestInterceptor;
+
+impl RequestInterceptor for MyRequestInterceptor {
+    fn intercept(
+        &self,
+        _transport: Arc<Transport>,
+        _session_id: SessionId,
+        request: RequestPausedEvent,
+    ) -> RequestPausedDecision {
+        let url = request.params.request.url;
+        let filetype = request.params.request.headers.0.expect("");
+        print!("URL chargée : {}", url);
+        if !filetype.get("Accept").map_or(false, |s| s.to_string().contains("text/css")) {
+            println!();
+            return RequestPausedDecision::Continue(None);
+        }
+        println!("... Blocked!");
+        RequestPausedDecision::Fail(FailRequest {
+            request_id: url,
+            error_reason: ErrorReason::BlockedByClient,
+        })
+    }
 }
 
 #[tokio::main]
@@ -71,13 +97,19 @@ async fn connect_to_planning(url: &str) -> Result<Vec<PlanningEvent>, anyhow::Er
     let tab = browser.new_tab()
         .expect("Failed to create new tab");
 
+    // Intercept CSS files and refuse them
+    /*let request_interceptor: Arc<dyn RequestInterceptor + Send + Sync> =
+        Arc::new(MyRequestInterceptor {});
+    tab.enable_fetch(None, None)?;
+    tab.enable_request_interception(request_interceptor)?;*/
+
     println!("Navigating to {}", url);
     tab.navigate_to(url)
         .expect("Failed to navigate");
 
     println!("Waiting for login page to load");
     tab.wait_for_element("input#username")
-        .expect("Failed to find username field");
+        .expect("Failed to find 'username' field");
 
     println!("Typing username");
     tab.send_character(var("UT1_USERNAME")
@@ -181,25 +213,20 @@ async fn scrape_events(tab: &Arc<Tab>, planning_container: &Vec<i32>, week: &u32
     println!("Scraping week {}", week);
 
     // put all elements in div.grilleData in a vector
-    let formatted_events;
     match tab.find_elements("div.grilleData > div") {
         Ok(elements) => {
             println!("Parsing events for week {}", week);
-            // add events of current week to PlanningEventCollected vec
-            events.extend(parse_events(elements, &week).await
+            // add events of current week to PlanningEvent vec
+            events.extend(parse_events(elements, &week, planning_container).await
                 .expect("Failed to parse events"));
-
-            // convert PlanningEventCollected to PlanningEvent
-            formatted_events = convert_events(&events, &planning_container).await
-                .expect("Failed to convert events");
         }
-        Err(_) => formatted_events = Vec::new(),
+        Err(_) => events = Vec::new(),
     };
 
-    Ok(formatted_events)
+    Ok(events)
 }
 
-async fn parse_events(html_events: Vec<Element<'_>>, week: &u32) -> Result<Vec<PlanningEventCollected>, String> {
+async fn parse_events(html_events: Vec<Element<'_>>, week: &u32, planning_container: &Vec<i32>) -> Result<Vec<PlanningEvent>, String> {
     let mut parsed_events = Vec::new();
 
     for event in html_events {
@@ -217,20 +244,17 @@ async fn parse_events(html_events: Vec<Element<'_>>, week: &u32) -> Result<Vec<P
             .collect::<Vec<_>>();
 
         // get event size by selecting table.event child of div.event
-        let event_size = event.find_element("table.event")
+        let event_height = event.find_element("table.event")
             .expect("Failed to find 'table.event' element")
             .attributes
             .expect("Failed to get 'table.event' attributes");
 
-        // collect Vec of width and height of table.event
-        let event_size = event_size
+        // collect height of table.event (necessary to calculate event duration)
+        let event_height = event_height
             .get(3)
             .expect("Failed to get 'table.event' style attribute")
-            .split("width:")
-            .last().unwrap()
-            .split("px;height:")
-            .map(|s| parse_int(s))
-            .collect::<Vec<_>>();
+            .split("height:")
+            .last().unwrap();
 
         // get event datas by selecting div.eventText child of div.event
         let event_datas = event.find_element("div.eventText")
@@ -250,31 +274,25 @@ async fn parse_events(html_events: Vec<Element<'_>>, week: &u32) -> Result<Vec<P
         // remove last element of vec ("</div>")
         event_datas.pop();
 
+        // convert event position/width/height to start hour and duration
+        let (start, duration_s) = convert_events(event_position[0], event_position[1], parse_int(event_height), &planning_container, week).await
+            .expect("Couldn't parse event position to event duration");
+
         // set event datas in struct and push it in parsed_events
-        parsed_events.push(PlanningEventCollected {
-            x: event_position[0],
-            y: event_position[1],
-            width: event_size[0],
-            height: event_size[1],
+        parsed_events.push(PlanningEvent {
+            start,
+            duration_s,
             cours: event_datas.remove(0).to_string(),
             salle: event_datas.remove(0).to_string(),
             prof: event_datas.remove(0).to_string(),
             notes: event_datas.pop().unwrap().to_string(),
-            groupe: event_datas.into_iter()
-                .map(|s| s.to_string())
-                .collect(),
-            week: *week,
         });
     }
 
     Ok(parsed_events)
 }
 
-async fn convert_events(events: &Vec<PlanningEventCollected>, planning_container: &Vec<i32>) -> Result<Vec<PlanningEvent>, String> {
-
-    println!("Converting events from week {}", events[0].week);
-
-    let mut converted_events = Vec::new();
+async fn convert_events(x: i32, y: i32, height: i32, planning_container: &Vec<i32>, week: &u32) -> Result<(chrono::naive::NaiveDateTime, Duration), String> {
 
     // store today 7 am in date format
     let date = chrono::Local::now().date_naive()
@@ -285,35 +303,21 @@ async fn convert_events(events: &Vec<PlanningEventCollected>, planning_container
         _ => date - Duration::days(Weekday::num_days_from_monday(&date.weekday()) as i64),
     };
 
-    // loop on vec of events to convert element positions to date and duration
-    for event in events {
-        // get px height of half hour and day
-        let half_hour_in_px = planning_container[1] as f32 / 28.0; // from 7 to 21, 14 hours -> 28 half hours
-        let day_in_px = planning_container[0] as f32 / 6.0; // 6 days
-        // calculate days overflow if event is in next week
-        let week_overflow = (event.week - chrono::Local::now().iso_week().week()) * 7;
-        // get start date of event (monday 7 am + x days + y half hours)
-        let start = date
-            + Duration::days(event.x as i64 / day_in_px as i64)
-            + Duration::minutes((event.y as i64 / half_hour_in_px as i64) * 30)
-            - Duration::hours(1)                    // -1 hour because of timezone
-            + Duration::days(week_overflow as i64); // + weeks if event is in next week
-        // get duration of event (event.height in px / half hours in px * 30 minutes)
-        let duration_s = Duration::minutes((event.height as i64 / half_hour_in_px as i64) * 30);
+    // get px height of half hour and day
+    let half_hour_in_px = planning_container[1] as f32 / 28.0; // from 7 to 21, 14 hours -> 28 half hours
+    let day_in_px = planning_container[0] as f32 / 6.0; // 6 days
+    // calculate days overflow if event is in next week
+    let week_overflow = (week - chrono::Local::now().iso_week().week()) * 7;
+    // get start date of event (monday 7 am + x days + y half hours)
+    let start = date
+        + Duration::days(x as i64 / day_in_px as i64)
+        + Duration::minutes((y as i64 / half_hour_in_px as i64) * 30)
+        - Duration::hours(1)                    // -1 hour because of timezone
+        + Duration::days(week_overflow as i64); // + weeks if event is in next week
+    // get duration of event (event.height in px / half hours in px * 30 minutes)
+    let duration_s = Duration::minutes((height as i64 / half_hour_in_px as i64) * 30);
 
-        // add event to vec of converted events
-        converted_events.push(PlanningEvent {
-            start,
-            duration_s,
-            cours: event.cours.clone(),
-            prof: event.prof.clone(),
-            salle: event.salle.clone(),
-            groupe: event.groupe.clone(),
-            notes: event.notes.clone(),
-        });
-    }
-
-    Ok(converted_events)
+    Ok((start, duration_s))
 }
 
 async fn create_ics(events: &Vec<PlanningEvent>) -> Result<&str, std::io::Error> {
@@ -329,12 +333,12 @@ async fn create_ics(events: &Vec<PlanningEvent>) -> Result<&str, std::io::Error>
 
         // create ics event
         let mut ics_event = Event::new(uid, Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
-        ics_event.push(DtStart::new(event.clone().start.format("%Y%m%dT%H%M%SZ").to_string()));
-        ics_event.push(DtEnd::new((event.clone().start + event.clone().duration_s).format("%Y%m%dT%H%M%SZ").to_string()));
-        ics_event.push(Summary::new(event.clone().cours));
-        ics_event.push(Location::new(event.clone().salle));
-        ics_event.push(Organizer::new(event.clone().prof));
-        ics_event.push(Description::new(event.clone().notes));
+        ics_event.push(DtStart::new(event.start.format("%Y%m%dT%H%M%SZ").to_string()));
+        ics_event.push(DtEnd::new((event.start + event.duration_s).format("%Y%m%dT%H%M%SZ").to_string()));
+        ics_event.push(Summary::new(&event.cours));
+        ics_event.push(Location::new(&event.salle));
+        ics_event.push(Organizer::new(&event.prof));
+        ics_event.push(Description::new(&event.notes));
 
         // Add it to calendar
         calendar.add_event(ics_event);
@@ -343,8 +347,22 @@ async fn create_ics(events: &Vec<PlanningEvent>) -> Result<&str, std::io::Error>
     // Save ics file in directory
     calendar.save_file("ut1.ics")?;
 
-    std::fs::copy("ut1.ics", "/Users/louistravaux/Documents/test/public/ut1.ics")
-        .expect("Failed to copy ics file to directory");
+    if var("PROD") == Ok("true".to_string()) {
+        // scp ics file to server
+        let mut child = std::process::Command::new("scp")
+            .arg("ut1.ics")
+            .arg(format!(
+                "{}:{}",
+                var("SERVER_IP").expect("SERVER_IP not set"),
+                var("PATH_TO_DEPLOY_ICS").expect("PATH_TO_DEPLOY_ICS not set"))
+            )
+            .spawn()
+            .expect("Failed to scp ics file to server");
+    } else {
+        std::fs::copy("ut1.ics", var("PATH_TO_DEPLOY_ICS")
+            .expect("PATH_TO_DEPLOY_ICS not set"))
+            .expect("Failed to copy ics file to directory");
+    }
 
     Ok("ICS saved in directory")
 }
