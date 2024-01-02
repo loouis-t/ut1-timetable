@@ -101,6 +101,7 @@ async fn main() -> Result<()> {
                 deploy_ics_file().await?;
 
                 // Wait 6 hour
+                println!("Done. Next run at: {}", chrono::Local::now() + Duration::hours(6));
                 tokio::time::sleep(tokio::time::Duration::from_secs(60 * 60 * 6)).await;
             },
             Err(e) => println!("INFO: {}", e),
