@@ -1,0 +1,6 @@
+<component name="CopyrightManager">
+  <copyright>
+    <option name="notice" value="Copyright (c) &amp;#36;originalComment.match(&quot;Copyright \(c\) (\d+)&quot;, 1, &quot;-&quot;, &quot;&amp;#36;today.year&quot;)&amp;#36;today.year. All rights reserved.&#10;This software is the confidential and proprietary information of Louis Travaux (&quot;Confidential Information&quot;). &#10;You shall not disclose such Confidential Information and shall use it only in accordance with the terms of the license agreement you entered into with Louis Travaux." />
+    <option name="myName" value="Louis Travaux" />
+  </copyright>
+</component>

@@ -1,4 +1,10 @@
-use headless_chrome::{Browser, Element, LaunchOptions, Tab};
+/*
+ * Copyright (c) 2024. All rights reserved.
+ * This software is the confidential and proprietary information of Louis Travaux ("Confidential Information").
+ * You shall not disclose such Confidential Information and shall use it only in accordance with the terms of the license agreement you entered into with Louis Travaux.
+ */
+
+use headless_chrome::{Browser, LaunchOptions};
 use std::{
     env::var,
     sync::Arc,
@@ -33,6 +39,7 @@ use ics::{Event, ICalendar, properties::{
 }};
 use rand::random;
 use anyhow::{Result, anyhow, Context};
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone)]
 pub struct PlanningEvent {
@@ -77,30 +84,44 @@ async fn main() -> Result<()> {
 
     let url = "https://cas.ut-capitole.fr/cas/login?service=https%3A%2F%2Fade-production.ut-capitole.fr%2Fdirect%2Fmyplanning.jsp";
 
-    let current_millis = chrono::Local::now().timestamp_millis();
-    let events = connect_to_planning(url).await?;
-    let new_millis = chrono::Local::now().timestamp_millis();
-    println!("Scraping took {} ms", new_millis - current_millis);
+    // scrape planning every 6 hours
+    loop {
+        let current_millis = chrono::Local::now().timestamp_millis();
 
-    create_ics(&events).await?;
+        // Connect to planning and scrape events
+        match scrape_ut1_planning(url).await {
+            Ok(events) => {
+                let new_millis = chrono::Local::now().timestamp_millis();
+                println!("Scraping took {} ms", new_millis - current_millis);
 
-    Ok(())
+                // Convert events to ics file
+                create_ics_from_planning_event_vec(&events).await?;
+
+                // deploy ics file
+                deploy_ics_file().await?;
+
+                // Wait 6 hour
+                tokio::time::sleep(tokio::time::Duration::from_secs(60 * 60 * 6)).await;
+            },
+            Err(e) => println!("INFO: {}", e),
+        };
+
+    }
+
 }
 
-async fn connect_to_planning(url: &str) -> Result<Vec<PlanningEvent>> {
+async fn scrape_ut1_planning(url: &str) -> Result<Vec<PlanningEvent>> {
     let mut chrome_args = Vec::new();
     chrome_args.push(std::ffi::OsStr::new("--blink-settings=imagesEnabled=false"));
 
     let launch_options = LaunchOptions::default_builder()
         .path(Some(default_executable().map_err(|e| anyhow!(e))?))
         .enable_gpu(true)
+        .sandbox(false)
         .args(chrome_args)
         .build()?;
-
-    println!("{:#?}", launch_options.path);
-
+    
     let browser = Browser::new(launch_options)?; // Launch headless Chrome browser
-
     let tab = browser.new_tab()?;               // Create a new tab
 
     // Intercept CSS files and refuse them
@@ -125,10 +146,22 @@ async fn connect_to_planning(url: &str) -> Result<Vec<PlanningEvent>> {
         .as_str())?
         .press_key("Enter")?;
 
-    println!("Redirecting to planning page");
-    let binding = tab.wait_for_element("div.grilleData")?
-        .attributes
-        .context("Failed to get 'planning container' attributes")?;
+    print!("Redirecting to planning page... ");
+    let binding = match tab.wait_for_element("div.grilleData") {
+        Ok(binding) => {
+            println!();
+            binding
+                .attributes
+                .context("Failed to get 'planning container' attributes")?
+        },
+        Err(_) => {
+            println!("Failed. Reloading to retry.");
+            tab.reload(false, None)?;
+            tab.wait_for_element("div.grilleData")?
+                .attributes
+                .context("Failed to get 'planning container' attributes")?
+        },
+    };
 
     // pre parse planning container style tag
     let planning_container = binding
@@ -148,7 +181,7 @@ async fn connect_to_planning(url: &str) -> Result<Vec<PlanningEvent>> {
 
     // create a vec containing 5 tabs (parallelize scraping)
     println!("Creating new tabs");
-    let mut handles = Vec::new();
+    let mut threads: Vec<JoinHandle<Result<Vec<PlanningEvent>>>> = Vec::new();
     let mut week = chrono::Local::now().iso_week().week();
     let mut tabs = Vec::new();
     tabs.push(tab.clone());
@@ -165,89 +198,107 @@ async fn connect_to_planning(url: &str) -> Result<Vec<PlanningEvent>> {
     }
 
     for tab in tabs {
-        let planning_container_clone = planning_container.clone();
-        let url_clone = url.to_string();
-        let handle = tokio::spawn(async move {
-            let real_week = chrono::Local::now().iso_week().week();
-            if (week - real_week) > 0 {
-                println!("New thread for week {} navigating to url", week % 52 + 1);
-                tab.navigate_to(url_clone.as_str())?;
+        let planning_container = planning_container.clone();
+        let url = url.to_string();
 
-                // wait for div.grilleData to load
-                tab.wait_for_element("div.grilleData")?;
+        let thread = tokio::spawn(async move {
+            let real_week = chrono::Local::now().iso_week().week();
+            let mut elements_attributes_vec = Vec::new();
+
+            if (week - real_week) > 0 {
+                println!("New thread (week {}) navigating to url", week);
+                tab.navigate_to(url.as_str())?;
 
                 // click on next week tab
-                tab.find_element(format!("table#x-auto-{}", week - 1).as_str())?
-                    .find_element("button.x-btn-text")?
-                    .click()?;
-
-                // wait for div.grilleData to load
-                tab.wait_for_element("div.grilleData")?;
+                let buttons = tab.wait_for_elements("button.x-btn-text")?;
+                for button in buttons {
+                    if button.get_inner_text()?.contains(format!("({})", week).as_str()) {
+                        button.click()?;
+                        break;
+                    }
+                }
             }
 
-            scrape_events(&tab, &planning_container_clone, &week).await
+            match tab.wait_for_elements("div.grilleData > div") {
+                Ok(html_el) => {
+                    let (mut event_height, mut event_data, mut event_style);
+
+                    for el in html_el {
+                        // get event's height
+                        event_height = el
+                            .find_element("table.event")?
+                            .get_attribute_value("style")?
+                            .context("Failed to get 'table.event' style attribute")?;
+
+                        // get event's data
+                        event_data = el
+                            .find_element("div.eventText")?
+                            .get_content()?;
+
+                        // get event's position
+                        event_style = el.get_attribute_value("style")?
+                            .context("Failed to get 'div.event' style attribute")?;
+
+                        elements_attributes_vec.push((event_style, event_height, event_data));
+                    }
+                }
+                Err(_) => {}, // POSSIBLY: no event for this week
+            }
+
+            match get_raw_planning_events(elements_attributes_vec, planning_container, &week).await {
+                Ok(events) => Ok(events),
+                Err(e) => {
+                    println!("INFO: {}", e);
+                    Ok(Vec::new())
+                }
+            }
         });
-        handles.push(handle);
+        threads.push(thread);
         week += 1;
     }
 
-    let mut all_events = Vec::new();
-    for handle in handles {
-        all_events.extend(handle.await??);
+    let mut merged_events_vectors = Vec::new();
+    for thread in threads {
+        match thread.await? {
+            Ok(events) => {
+                if !events.is_empty() {
+                    merged_events_vectors.extend(events)
+                }
+            },
+            Err(e) => println!("INFO: {}", e),
+        }
     }
 
-    Ok(all_events)
+    Ok(merged_events_vectors)
 }
 
-async fn scrape_events(
-    tab: &Arc<Tab>,
-    planning_container: &Vec<i32>,
+async fn get_raw_planning_events(
+    elements: Vec<(String, String, String)>,
+    planning_container: Vec<i32>,
     week: &u32,
 ) -> Result<Vec<PlanningEvent>> {
+    // handle no elements for current week
+    if elements.is_empty() {
+        return Err(anyhow!("No event for week {}", week));
+    }
+
+    println!("Getting raw planning events for week {}", week);
+
     let mut events = Vec::new();
-
-    println!("Scraping week {}", week % 52 + 1);
-
-    // put all elements in div.grilleData in a vector. null vec if no elements
-    match tab.find_elements("div.grilleData > div.event") {
-        Ok(elements) => {
-            println!("Parsing events for week {}", week);
-            // add events of current week to PlanningEvent vec
-            let mut threads = Vec::new();
-            for element in elements {
-                let thread = tokio::spawn(async move {
-                    parse_events(&element, week, planning_container).await
-                });
-
-                threads.push(thread);
-            }
-
-            for thread in threads {
-                events.push(thread.await??);
-            }
-
-            /*events.extend(parse_events(
-                elements,
-                &week,
-                planning_container,
-            ).await?);*/
-        }
-        _ => {}
-    };
+    for element in elements {
+        events.push(parse_event(&element, &week, &planning_container).await?)
+    }
 
     Ok(events)
 }
 
-async fn parse_events(
-    event: &Element<'_>,
+
+async fn parse_event(
+    (event, event_height, event_data): &(String, String, String),
     week: &u32,
     planning_container: &Vec<i32>,
 ) -> Result<PlanningEvent> {
-
-    let event_position = event.attributes
-        .clone()
-        .context("Failed to get 'div.event' attributes")?
-        .get(1).unwrap()
+    let event_position = event
         .split("absolute; ")
         .last()
         .context("Failed to split 'div.event' style attribute ('absolute; ')")?
@@ -258,24 +309,13 @@ async fn parse_events(
         .map(|s| parse_int(s))
         .collect::<Vec<_>>();
 
-    // get event size by selecting table.event child of div.event
-    let event_height = event.find_element("table.event")?
-        .attributes
-        .context("Failed to get 'table.event' attributes")?;
-
     // collect height of table.event (necessary to calculate event duration)
     let event_height = event_height
-        .get(3)
-        .context("Failed to get 'table.event' style attribute")?
         .split("height:")
         .last()
         .context("Failed to split 'table.event' style attribute ('height:')")?;
 
-    // get event datas by selecting div.eventText child of div.event
-    let event_datas = event.find_element("div.eventText")?
-        .get_content()
-        .context("Failed to get 'div.eventText' content")?;
-    let mut event_datas = event_datas
+    let mut event_data = event_data
         .split("eventText\">")
         .last()
         .context("Failed to split 'div.eventText' content ('eventText\">')")?
@@ -283,12 +323,12 @@ async fn parse_events(
         .collect::<Vec<_>>();
 
     // parses the 2nd element of vec into multiple elements
-    event_datas = event_datas.into_iter()
+    event_data = event_data.into_iter()
         .flat_map(|s| s.split("<br>").collect::<Vec<_>>())
         .collect();
 
     // remove last element of vec ("</div>")
-    event_datas.pop();
+    event_data.pop();
 
     // convert event position/width/height to start hour and duration
     let (start, duration_s) = convert_events(
@@ -302,12 +342,11 @@ async fn parse_events(
     Ok(PlanningEvent {
         start,
         duration_s,
-        cours: event_datas.remove(0).to_string(),
-        salle: event_datas.remove(0).to_string(),
-        prof: event_datas.remove(0).to_string(),
-        notes: event_datas.pop().unwrap().to_string(),
+        cours: event_data.remove(0).to_string(),
+        salle: event_data.remove(0).to_string(),
+        prof: event_data.remove(0).to_string(),
+        notes: event_data.pop().unwrap().replace("\n", " "),
     })
-
 }
 
 
@@ -345,7 +384,7 @@ async fn convert_events(
     Ok((start, duration_s))
 }
 
-async fn create_ics(events: &Vec<PlanningEvent>) -> Result<&str> {
+async fn create_ics_from_planning_event_vec(events: &Vec<PlanningEvent>) -> Result<&str> {
     println!("Creating ics file from merged events");
 
     // create ics calendar
@@ -354,10 +393,9 @@ async fn create_ics(events: &Vec<PlanningEvent>) -> Result<&str> {
         "https://www.github.com/loouis-t/ut1-timetable",
     );
 
-    let mut handles = Vec::new();
+    let mut threads = Vec::new();
     for event in events.clone() {
-        println!("new thread for event");
-        let handle = tokio::spawn(async move {
+        let thread = tokio::spawn(async move {
             // create random uid
             let uid = format!("{}", random::<i64>());
 
@@ -381,42 +419,21 @@ async fn create_ics(events: &Vec<PlanningEvent>) -> Result<&str> {
             // return event
             ics_event
         });
-        handles.push(handle);
+        threads.push(thread);
     }
 
-    for handle in handles {
-        calendar.add_event(handle.await?);
+    for thread in threads {
+        calendar.add_event(thread.await?);
     }
-
-    // loop over events to create ics events
-    /*for event in events {
-        // create random uid
-        let uid = format!("{}", random::<i64>());
-
-        // create ics event
-        let mut ics_event = Event::new(
-            uid,
-            Utc::now().format("%Y%m%dT%H%M%SZ").to_string(),
-        );
-        ics_event.push(DtStart::new(
-            event.start.format("%Y%m%dT%H%M%SZ").to_string())
-        );
-        ics_event.push(DtEnd::new(
-            (event.start + event.duration_s)
-                .format("%Y%m%dT%H%M%SZ").to_string())
-        );
-        ics_event.push(Summary::new(&event.cours));
-        ics_event.push(Location::new(&event.salle));
-        ics_event.push(Organizer::new(&event.prof));
-        ics_event.push(Description::new(&event.notes));
-
-        // Add it to calendar
-        calendar.add_event(ics_event);
-    }*/
 
     // Save ics file in directory
     calendar.save_file("ut1.ics")?;
 
+    Ok("ICS saved in directory")
+}
+
+async fn deploy_ics_file() -> Result<&'static str> {
+    println!("Deploying ics file");
     if var("PROD")? == "true".to_string() {
         // scp ics file to server
         std::process::Command::new("scp")
@@ -428,10 +445,13 @@ async fn create_ics(events: &Vec<PlanningEvent>) -> Result<&str> {
             ))
             .spawn()?;
     } else {
-        std::fs::copy("ut1.ics", var("PATH_TO_DEPLOY_ICS")?)?;
+        match std::fs::copy("ut1.ics", var("PATH_TO_DEPLOY_ICS")?) {
+            Ok(_) => {},
+            Err(_) => println!("INFO: Running inside docker container, ics file not copied"),
+        }
     }
 
-    Ok("ICS saved in directory")
+    Ok("ICS deployed")
 }
 
 // just converts string to i32 and removes "px;" if present

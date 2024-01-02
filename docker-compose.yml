@@ -1,0 +1,8 @@
+version: '3.8'
+services:
+  ut1-timetable:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ut1-timetable
+    container_name: ut1-timetable
