@@ -12,7 +12,7 @@ FROM debian:12-slim
 WORKDIR /app
 
 # Install Chromium
-RUN apt-get update && apt-get install -y chromium openssh
+RUN apt-get update && apt-get install -y chromium openssh-client
 
 # Copy over the built application from the builder stage
 COPY --from=builder /app/target/release/ut1-timetable /app/ut1-timetable
