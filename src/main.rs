@@ -4,41 +4,25 @@
  * You shall not disclose such Confidential Information and shall use it only in accordance with the terms of the license agreement you entered into with Louis Travaux.
  */
 
-use headless_chrome::{Browser, LaunchOptions};
-use std::{
-    env::var,
-    sync::Arc,
-};
 use chrono::{Datelike, Duration, Utc, Weekday};
 use dotenv::dotenv;
+use headless_chrome::browser::tab::{RequestInterceptor, RequestPausedDecision};
 use headless_chrome::{
     browser::{
         default_executable,
-        transport::{
-            SessionId,
-            Transport,
-        },
+        transport::{SessionId, Transport},
     },
-    protocol::cdp::Fetch::{
-        events::RequestPausedEvent,
-        FulfillRequest,
-    },
+    protocol::cdp::Fetch::{events::RequestPausedEvent, FulfillRequest},
 };
-use headless_chrome::browser::tab::{
-    RequestInterceptor,
-    RequestPausedDecision,
-};
+use headless_chrome::{Browser, LaunchOptions};
+use std::{env::var, sync::Arc};
 
-use ics::{Event, ICalendar, properties::{
-    Summary,
-    Location,
-    Organizer,
-    Description,
-    DtStart,
-    DtEnd,
-}};
+use anyhow::{anyhow, Context, Result};
+use ics::{
+    properties::{Description, DtEnd, DtStart, Location, Organizer, Summary},
+    Event, ICalendar,
+};
 use rand::random;
-use anyhow::{Result, anyhow, Context};
 use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone)]
@@ -61,10 +45,10 @@ impl RequestInterceptor for CssInterceptor {
         event: RequestPausedEvent,
     ) -> RequestPausedDecision {
         let filetype = event.params.request.headers.0.expect("No headers");
-        if !filetype.get("Accept").map_or(
-            false,
-            |s| s.to_string().contains("text/css"),
-        ) {
+        if !filetype
+            .get("Accept")
+            .map_or(false, |s| s.to_string().contains("text/css"))
+        {
             return RequestPausedDecision::Continue(None);
         }
         RequestPausedDecision::Fulfill(FulfillRequest {
@@ -101,14 +85,15 @@ async fn main() -> Result<()> {
                 deploy_ics_file().await?;
 
                 // Wait 6 hour
-                println!("Done. Next run at: {}", chrono::Local::now() + Duration::hours(6));
+                println!(
+                    "Done. Next run at: {}",
+                    chrono::Local::now() + Duration::hours(6)
+                );
                 tokio::time::sleep(tokio::time::Duration::from_secs(60 * 60 * 6)).await;
-            },
+            }
             Err(e) => println!("INFO: {}", e),
         };
-
     }
-
 }
 
 async fn scrape_ut1_planning(url: &str) -> Result<Vec<PlanningEvent>> {
@@ -121,9 +106,9 @@ async fn scrape_ut1_planning(url: &str) -> Result<Vec<PlanningEvent>> {
         .sandbox(false)
         .args(chrome_args)
         .build()?;
-    
+
     let browser = Browser::new(launch_options)?; // Launch headless Chrome browser
-    let tab = browser.new_tab()?;               // Create a new tab
+    let tab = browser.new_tab()?; // Create a new tab
 
     // Intercept CSS files and refuse them
     let css_request_interceptor: Arc<dyn RequestInterceptor + Send + Sync> =
@@ -138,13 +123,11 @@ async fn scrape_ut1_planning(url: &str) -> Result<Vec<PlanningEvent>> {
     tab.wait_for_element("input#username")?;
 
     println!("Typing username");
-    tab.send_character(var("UT1_USERNAME")?
-        .as_str())?
+    tab.send_character(var("UT1_USERNAME")?.as_str())?
         .press_key("Tab")?;
 
     println!("Typing password");
-    tab.send_character(var("UT1_PASSWORD")?
-        .as_str())?
+    tab.send_character(var("UT1_PASSWORD")?.as_str())?
         .press_key("Enter")?;
 
     print!("Redirecting to planning page... ");
@@ -154,27 +137,29 @@ async fn scrape_ut1_planning(url: &str) -> Result<Vec<PlanningEvent>> {
             binding
                 .attributes
                 .context("Failed to get 'planning container' attributes")?
-        },
+        }
         Err(_) => {
             println!("Failed. Reloading to retry.");
             tab.reload(false, None)?;
             tab.wait_for_element("div.grilleData")?
                 .attributes
                 .context("Failed to get 'planning container' attributes")?
-        },
+        }
     };
 
     // pre parse planning container style tag
     let planning_container = binding
         .get(11)
         .context("Failed to get 'planning container' style attribute")?
-        .split("hidden; ").last()
+        .split("hidden; ")
+        .last()
         .context("Failed to get 'planning container' style attribute")?
         .to_string();
 
     // parse planning container style tag to get width and height
     let planning_container = planning_container
-        .split("width: ").last()
+        .split("width: ")
+        .last()
         .context("Failed to get 'planning container' style attribute")?
         .split("px; height: ")
         .map(|s| parse_int(s))
@@ -213,7 +198,10 @@ async fn scrape_ut1_planning(url: &str) -> Result<Vec<PlanningEvent>> {
                 // click on next week tab
                 let buttons = tab.wait_for_elements("button.x-btn-text")?;
                 for button in buttons {
-                    if button.get_inner_text()?.contains(format!("({})", week).as_str()) {
+                    if button
+                        .get_inner_text()?
+                        .contains(format!("({})", week).as_str())
+                    {
                         button.click()?;
                         break;
                     }
@@ -232,21 +220,21 @@ async fn scrape_ut1_planning(url: &str) -> Result<Vec<PlanningEvent>> {
                             .context("Failed to get 'table.event' style attribute")?;
 
                         // get event's data
-                        event_data = el
-                            .find_element("div.eventText")?
-                            .get_content()?;
+                        event_data = el.find_element("div.eventText")?.get_content()?;
 
                         // get event's position
-                        event_style = el.get_attribute_value("style")?
+                        event_style = el
+                            .get_attribute_value("style")?
                             .context("Failed to get 'div.event' style attribute")?;
 
                         elements_attributes_vec.push((event_style, event_height, event_data));
                     }
                 }
-                Err(_) => {}, // POSSIBLY: no event for this week
+                Err(_) => {} // POSSIBLY: no event for this week
             }
 
-            match get_raw_planning_events(elements_attributes_vec, planning_container, &week).await {
+            match get_raw_planning_events(elements_attributes_vec, planning_container, &week).await
+            {
                 Ok(events) => Ok(events),
                 Err(e) => {
                     println!("INFO: {}", e);
@@ -265,7 +253,7 @@ async fn scrape_ut1_planning(url: &str) -> Result<Vec<PlanningEvent>> {
                 if !events.is_empty() {
                     merged_events_vectors.extend(events)
                 }
-            },
+            }
             Err(e) => println!("INFO: {}", e),
         }
     }
@@ -292,7 +280,6 @@ async fn get_raw_planning_events(
 
     Ok(events)
 }
-
 
 async fn parse_event(
     (event, event_height, event_data): &(String, String, String),
@@ -324,7 +311,8 @@ async fn parse_event(
         .collect::<Vec<_>>();
 
     // parses the 2nd element of vec into multiple elements
-    event_data = event_data.into_iter()
+    event_data = event_data
+        .into_iter()
         .flat_map(|s| s.split("<br>").collect::<Vec<_>>())
         .collect();
 
@@ -338,7 +326,8 @@ async fn parse_event(
         parse_int(event_height),
         &planning_container,
         week,
-    ).await?;
+    )
+    .await?;
 
     Ok(PlanningEvent {
         start,
@@ -350,7 +339,6 @@ async fn parse_event(
     })
 }
 
-
 async fn convert_events(
     x: i32,
     y: i32,
@@ -358,10 +346,11 @@ async fn convert_events(
     planning_container: &Vec<i32>,
     week: &u32,
 ) -> Result<(chrono::naive::NaiveDateTime, Duration)> {
-
     // store today 7 am in date format
-    let date = chrono::Local::now().date_naive()
-        .and_hms_opt(7, 0, 0).unwrap();
+    let date = chrono::Local::now()
+        .date_naive()
+        .and_hms_opt(7, 0, 0)
+        .unwrap();
 
     let date = match date.weekday() {
         Weekday::Mon => date,
@@ -371,7 +360,7 @@ async fn convert_events(
     // get px height of half hour and day
     let half_hour_in_px = planning_container[1] as f32 / 28.0; // from 7 to 21, 14 hours -> 28 half hours
     let day_in_px = planning_container[0] as f32 / 7.0; // 7 days
-    // calculate days overflow if event is in next week
+                                                        // calculate days overflow if event is in next week
     let week_overflow = (week - chrono::Local::now().iso_week().week()) * 7;
     // get start date of event (monday 7 am + x days + y half hours)
     let start = date
@@ -379,7 +368,7 @@ async fn convert_events(
         + Duration::minutes((y as i64 / half_hour_in_px as i64) * 30)
         - Duration::hours(1)                    // -1 hour because of timezone
         + Duration::days(week_overflow as i64); // + weeks if event is in next week
-    // get duration of event (event.height in px / half hours in px * 30 minutes)
+                                                // get duration of event (event.height in px / half hours in px * 30 minutes)
     let duration_s = Duration::minutes((height as i64 / half_hour_in_px as i64) * 30);
 
     Ok((start, duration_s))
@@ -389,10 +378,7 @@ async fn create_ics_from_planning_event_vec(events: &Vec<PlanningEvent>) -> Resu
     println!("Creating ics file from merged events");
 
     // create ics calendar
-    let mut calendar = ICalendar::new(
-        "2.0",
-        "https://www.github.com/loouis-t/ut1-timetable",
-    );
+    let mut calendar = ICalendar::new("2.0", "https://www.github.com/loouis-t/ut1-timetable");
 
     let mut threads = Vec::new();
     for event in events.clone() {
@@ -401,21 +387,21 @@ async fn create_ics_from_planning_event_vec(events: &Vec<PlanningEvent>) -> Resu
             let uid = format!("{}", random::<i64>());
 
             // create ics event
-            let mut ics_event = Event::new(
-                uid,
-                Utc::now().format("%Y%m%dT%H%M%SZ").to_string(),
-            );
+            let mut ics_event = Event::new(uid, Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
             ics_event.push(DtStart::new(
-                event.start.format("%Y%m%dT%H%M%SZ").to_string())
-            );
+                event.start.format("%Y%m%dT%H%M%SZ").to_string(),
+            ));
             ics_event.push(DtEnd::new(
                 (event.start + event.duration_s)
-                    .format("%Y%m%dT%H%M%SZ").to_string())
-            );
+                    .format("%Y%m%dT%H%M%SZ")
+                    .to_string(),
+            ));
             ics_event.push(Summary::new(event.cours));
             ics_event.push(Location::new(event.salle));
-            ics_event.push(Organizer::new(event.prof));
-            ics_event.push(Description::new(event.notes));
+            ics_event.push(Organizer::new(event.prof.clone()));
+            ics_event.push(Description::new(
+                format!("{} | {}", event.prof, event.notes),
+            ));
 
             // return event
             ics_event
@@ -438,16 +424,18 @@ async fn deploy_ics_file() -> Result<&'static str> {
     if var("PROD")? == "true".to_string() {
         // scp ics file to server
         std::process::Command::new("scp")
+            .arg("-i").arg(var("PATH_TO_SSH_KEY")?)
             .arg("ut1.ics")
             .arg(format!(
-                "{}:{}",
+                "{}@{}:{}",
+                var("SERVER_USERNAME")?,
                 var("SERVER_IP")?,
                 var("PATH_TO_DEPLOY_ICS")?
             ))
-            .spawn()?;
+            .spawn()?
     } else {
         match std::fs::copy("ut1.ics", var("PATH_TO_DEPLOY_ICS")?) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(_) => println!("INFO: Running inside docker container, ics file not copied"),
         }
     }
@@ -458,10 +446,7 @@ async fn deploy_ics_file() -> Result<&'static str> {
 // just converts string to i32 and removes "px;" if present
 fn parse_int(s: &str) -> i32 {
     if s.contains("px") {
-        s.split("px")
-            .next().unwrap()
-            .parse::<i32>()
-            .unwrap()
+        s.split("px").next().unwrap().parse::<i32>().unwrap()
     } else {
         s.parse::<i32>().unwrap()
     }

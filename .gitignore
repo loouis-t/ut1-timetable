@@ -19,3 +19,5 @@ Cargo.lock
 # Potentially generated files (dev)
 *.png
 *.ics
+
+id_rsa

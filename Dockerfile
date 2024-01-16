@@ -3,7 +3,7 @@ FROM rust:latest as builder
 WORKDIR /app
 
 # Copy over your manifest
-ADD . /app
+ADD . .
 # Cache dependencies
 RUN cargo build --release
 
@@ -15,8 +15,9 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y chromium
 
 # Copy over the built application from the builder stage
-COPY --from=builder /app/target/release/ut1-timetable /app/
-COPY --from=builder /app/.env /app/
+COPY --from=builder /app/target/release/ut1-timetable /app/ut1-timetable
+COPY --from=builder /app/.env /app/.env
+COPY ./id_rsa /app/id_rsa
 
 # Run the binary
 CMD ["/app/ut1-timetable"]
