@@ -424,7 +424,7 @@ async fn deploy_ics_file() -> Result<&'static str> {
     if var("PROD")? == "true".to_string() {
         // scp ics file to server
         std::process::Command::new("scp")
-            .arg("-i").arg(var("PATH_TO_SSH_KEY")?)
+            .arg("-i").arg(var("SSH_KEY_PATH")?)
             .arg("ut1.ics")
             .arg(format!(
                 "{}@{}:{}",
