@@ -432,7 +432,7 @@ async fn deploy_ics_file() -> Result<&'static str> {
                 var("SERVER_IP")?,
                 var("PATH_TO_DEPLOY_ICS")?
             ))
-            .spawn()?
+            .spawn()?;
     } else {
         match std::fs::copy("ut1.ics", var("PATH_TO_DEPLOY_ICS")?) {
             Ok(_) => {}
